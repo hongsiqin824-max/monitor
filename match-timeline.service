@@ -1,0 +1,36 @@
+# systemd 守护配置 —— Linux 生产服务器用（无需 pm2）
+# 部署步骤：
+#   1) 按实际改下面的 User / WorkingDirectory / ExecStart 里的 node 和脚本绝对路径
+#      查 node 路径：  which node
+#   2) sudo cp match-timeline.service /etc/systemd/system/
+#   3) sudo systemctl daemon-reload
+#   4) sudo systemctl enable --now match-timeline     # 开机自启 + 立即启动
+#   5) journalctl -u match-timeline -f                # 看实时日志
+#   常用：systemctl status/restart/stop match-timeline
+
+[Unit]
+Description=Dongqiudi match timeline notifier (WebSocket)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=app
+WorkingDirectory=/opt/monitor
+# 改成服务器上 which node 的真实路径，脚本也用绝对路径
+ExecStart=/usr/bin/node /opt/monitor/match_timeline.mjs
+Environment=NODE_ENV=production
+Environment=TZ=Asia/Shanghai
+# 进程退出即自动重启（与脚本内 WS 自动重连形成双层保活）
+Restart=always
+RestartSec=3
+# 优雅退出：发 SIGTERM，脚本会打印时间线并刷盘后退出
+KillSignal=SIGTERM
+TimeoutStopSec=10
+# 资源与日志
+MemoryMax=400M
+StandardOutput=append:/var/log/match-timeline.log
+StandardError=append:/var/log/match-timeline.err.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+# 运行时产生的数据（可能含真实抓包内容，勿上传）
+notifications.jsonl
+events.jsonl
+logs/
+*.log
+
+# 内部项目管理（进度/交接/日志）
+00_项目管理/
+
+# 依赖与系统文件
+node_modules/
+.DS_Store
