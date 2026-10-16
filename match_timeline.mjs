@@ -1,6 +1,7 @@
 // 懂球帝实时赛事 —— 按 match_id 聚合成"每场比赛时间线"，并对关键事件实时推送通知
 // 事件类型：进球(goal) / 角球(corner) / 红牌(red_card)
-// 检测方式：双保险 = push_card 服务端信号 + 按 match_id 的状态 diff（以 diff 的数值变化为准，兼顾去重）
+// 检测方式：进球 = 服务端 type="G" 信号（按唯一 id 去重，仅 status=Playing）；
+//          角球/红牌 = 状态 diff + push_card 信号双保险（以 diff 数值变化为准，兼顾去重）
 // 说明：只处理足球(soccer)；篮球无角球/红牌，比分高频跳动不在本需求内。
 //
 // 用法：
@@ -14,10 +15,16 @@ const args = process.argv.slice(2);
 const getArg = (n, d) => { const i = args.indexOf(n); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
 const RUN_SECONDS = Number(getArg("--seconds", 0));
 const OUT_FILE = getArg("--out", "notifications.jsonl");
+// Forward 进球/红牌 to the 8901 monitor console (loopback when co-deployed), which
+// fans out to its page + Feishu. Empty URL disables forwarding (JSONL still kept).
+const INGEST_URL = getArg("--ingest-url", process.env.GIF_8901_INGEST_URL || "http://127.0.0.1:8901/api/monitor/events/ingest");
+const INGEST_TOKEN = process.env.GIF_8901_INGEST_TOKEN || "";
+const ALERT_POST_TYPES = new Set(["goal", "red_card"]);
 
 const EVENT_CN = { goal: "进球", corner: "角球", red_card: "红牌" };
-// push_card 取值 → 内部事件类型
-const PUSH_CARD_MAP = { goal: "goal", corners: "corner", red_cards: "red_card" };
+// 服务端信号 → 内部事件类型。
+// 进球由 content.type==="G" 标志（实测确认）；push_card 仅在角球/红黄牌时出现，取值 corners/red_cards/yellow_cards。
+const PUSH_CARD_MAP = { corners: "corner", red_cards: "red_card" };
 
 // 把比分/统计字段转成整数；空串或非数字返回 null（表示"未知"，不参与 diff）
 const toInt = (s) => {
@@ -30,6 +37,24 @@ const toInt = (s) => {
 const matches = new Map();
 const out = fs.createWriteStream(OUT_FILE, { flags: "a" });
 let totalMsg = 0, notifyCount = 0;
+
+// Fire-and-forget POST of a goal/red-card to 8901. Never throws and never blocks
+// detection: a 3s timeout and a swallowed error keep the JSONL path authoritative.
+async function postAlert(payload) {
+  if (!INGEST_URL) return;
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (INGEST_TOKEN) headers["X-Monitor-Token"] = INGEST_TOKEN;
+    await fetch(INGEST_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(3000),
+    });
+  } catch (e) {
+    console.log(`[${new Date().toISOString()}] [ALERT] 推送 8901 失败: ${e.message}`);
+  }
+}
 
 // 比较某一项统计（A/B 两侧），返回发生"增加"的事件列表
 function diffStat(eventType, prev, cur) {
@@ -59,29 +84,40 @@ function handleMatch(env, c) {
     st = {
       match_id: id, match_title: c.match_title, cmp_type: c.cmp_type,
       team_A_id: c.team_A_id, team_B_id: c.team_B_id,
-      last: cur, timeline: [], sig: new Set(),   // sig: 已用push_card兜底通知过的 事件|队 键
+      last: cur, timeline: [], sig: new Set(),   // sig: 已兜底通知过的 事件|队 键（角球/红牌）
+      goals: new Set(),                          // 已报过的进球唯一 id（type="G" 去重）
     };
     matches.set(id, st);
     return;
   }
 
-  // ① 状态 diff 检测三类事件（基线单调不减，天然去重：数值抖动回落不会误报）
+  // ① 角球/红牌：状态 diff 检测（基线单调不减，天然去重；进球不再用 diff，改用下方 type="G" 信号）
   const detected = [
-    ...diffStat("goal", st.last.fs, cur.fs),
     ...diffStat("corner", st.last.corners, cur.corners),
     ...diffStat("red_card", st.last.rc, cur.rc),
   ];
   // diff 一旦真实推进，清掉对应 sig 标记，使后续新一轮同类事件仍可被兜底
   for (const d of detected) st.sig.delete(`${d.event_type}|${d.team}`);
 
-  // ② push_card 服务端信号兜底：仅当 diff 没抓到(例如数值未知)且该 事件|队 尚未兜底过时，补一条
+  // ② 进球：服务端 type==="G" 信号，按唯一 id 去重，只处理进行中的比赛。
+  //    实测每粒进球带稳定唯一 id、正常只推一次；偶有对已结束比赛的补发，故用 id 去重 + status 过滤。
+  if (c.type === "G" && c.status === "Playing") {
+    const goalId = String(c.id ?? "").replace(/"/g, "");
+    if (goalId && !st.goals.has(goalId)) {
+      st.goals.add(goalId);
+      const side = c.target_team === 2 ? "B" : c.target_team === 1 ? "A" : "?";
+      detected.push({ event_type: "goal", team: side, from: null, to: null, source: "signal", event_id: goalId });
+    }
+  }
+
+  // ③ 角球/红牌 push_card 信号兜底：仅当 diff 没抓到(例如数值未知)且该 事件|队 尚未兜底过时，补一条
   const signaled = c.push_card ? PUSH_CARD_MAP[String(c.push_card)] : null;
   if (signaled && !detected.some((e) => e.event_type === signaled)) {
     const side = c.target_team === 2 ? "B" : c.target_team === 1 ? "A" : "?";
     const sigKey = `${signaled}|${side}`;
     if (!st.sig.has(sigKey)) {
       st.sig.add(sigKey);
-      detected.push({ event_type: signaled, team: side, from: null, to: null, by_signal: true });
+      detected.push({ event_type: signaled, team: side, from: null, to: null, source: "push_card" });
     }
   }
 
@@ -100,7 +136,7 @@ function handleMatch(env, c) {
         score: `${cur.fs.A ?? "-"}-${cur.fs.B ?? "-"}`,
         corners: `${cur.corners.A ?? "-"}-${cur.corners.B ?? "-"}`,
       },
-      source: d.by_signal ? "push_card" : "diff",      // 来源：状态diff / 服务端信号
+      source: d.source || "diff",                     // 来源：diff(角球/红牌比分) / signal(进球type=G) / push_card(角球红牌信号)
       push_time: env.timestamp,
     };
     st.timeline.push(notif);
@@ -109,6 +145,22 @@ function handleMatch(env, c) {
     const teamTxt = d.team === "?" ? "?" : `${d.team}队(${notif.team_id})`;
     const fromTo = d.from != null ? ` ${d.from}→${d.to}` : "";
     console.log(`🔔[${notif.event_cn}] ${st.match_title} | ${teamTxt}${fromTo} | 比分${notif.detail.score} | ${minute} | 来源:${notif.source}`);
+    // Forward only goal/red-card to 8901 (8901 filters again by capturable match).
+    if (ALERT_POST_TYPES.has(d.event_type)) {
+      postAlert({
+        match_id: id,
+        event_type: d.event_type,
+        team: d.team,
+        team_id: notif.team_id,
+        from: d.from,
+        to: d.to,
+        score: notif.detail.score,
+        minute,
+        match_title: st.match_title,
+        source: notif.source,
+        dedup_key: `${id}|${d.event_type}|${d.team}|${d.event_id ?? d.to}`,
+      });
+    }
   }
 
   // ③ 更新基线：只增不减（进球/角球/红牌为单调递增计数；忽略服务端瞬时回落的脏数据）
