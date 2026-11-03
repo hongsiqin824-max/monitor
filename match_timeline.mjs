@@ -76,7 +76,12 @@ function handleMatch(env, c) {
     corners: { A: toInt(c.corners_A), B: toInt(c.corners_B) },
     rc: { A: toInt(c.rc_A), B: toInt(c.rc_B) },
   };
-  const minute = `${c.minute_period || ""} ${c.playing_time ?? ""}`.trim();
+  // 补时：playing_time 停在 45/90，补的分钟在 minute_extra（如 2H 90 + 6 → "2H 90+6"）。
+  // 不带它，同场两个补时事件都是 90'，懂球帝后台会把第二篇 GIF 文章判重。
+  const playing = String(c.playing_time ?? "").trim();
+  const extra = String(c.minute_extra ?? "").trim();
+  const clock = /^\d{1,3}$/.test(playing) && /^[1-9]\d?$/.test(extra) ? `${playing}+${extra}` : playing;
+  const minute = `${c.minute_period || ""} ${clock}`.trim();
 
   let st = matches.get(id);
   if (!st) {
